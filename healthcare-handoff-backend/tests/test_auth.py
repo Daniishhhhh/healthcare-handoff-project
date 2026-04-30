@@ -18,7 +18,7 @@ def test_signup_success(client):
     data = response.json()
     assert data["email"] == "john@example.com"
     assert data["role"] == "nurse"
-    assert data["is_active"] is True
+    assert data["is_active"]
     assert "id" in data
     assert "created_at" in data
 
