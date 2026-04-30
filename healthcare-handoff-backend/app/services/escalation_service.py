@@ -1,0 +1,167 @@
+"""Escalation service for handling handoff escalations."""
+
+from datetime import datetime
+from typing import List
+from sqlalchemy.orm import Session
+import uuid
+
+from app.models.handoff import Handoff, HandoffStatusEnum
+from app.models.escalation_event import EscalationEvent
+from app.repositories.handoff_repo import HandoffRepository
+from app.repositories.item_repo import HandoffItemRepository
+from app.repositories.escalation_repo import EscalationEventRepository
+from app.services.audit_service import AuditService
+from app.exceptions import ResourceNotFound
+
+
+class EscalationService:
+    """Service for handling handoff escalations."""
+
+    def __init__(self, db: Session):
+        self.db = db
+        self.handoff_repo = HandoffRepository(db)
+        self.item_repo = HandoffItemRepository(db)
+        self.escalation_repo = EscalationEventRepository(db)
+        self.audit_service = AuditService(db)
+
+    def escalate_handoff(
+        self,
+        handoff_id: str,
+        triggered_by: str,
+        reason: str,
+        user_id: str,
+        action_taken: str = None, # type: ignore
+    ) -> EscalationEvent:
+        """
+        Escalate a handoff to ESCALATED status.
+        
+        Args:
+            handoff_id: ID of handoff to escalate
+            triggered_by: "MANUAL" or "AUTO" (from background job)
+            reason: Human-readable reason for escalation
+            user_id: User performing the escalation
+            action_taken: Optional action description
+        """
+        
+        handoff = self.handoff_repo.get(handoff_id)
+        if not handoff:
+            raise ResourceNotFound("Handoff", handoff_id)
+
+        # Record escalation event
+        event = EscalationEvent(
+            id=str(uuid.uuid4()),
+            handoff_id=handoff_id,
+            triggered_by=triggered_by,
+            reason=reason,
+            action_taken=action_taken,
+        )
+        event = self.escalation_repo.create(event)
+
+        # Transition handoff to ESCALATED if not already
+        if handoff.status != HandoffStatusEnum.ESCALATED:
+            old_status = handoff.status.value
+            handoff.status = HandoffStatusEnum.ESCALATED
+            handoff.updated_at = datetime.utcnow()
+            handoff = self.handoff_repo.create(handoff)
+
+            self.audit_service.log_action(
+                user_id=user_id,
+                entity_type="HANDOFF",
+                entity_id=handoff_id,
+                action="ESCALATE",
+                old_values={"status": old_status},
+                new_values={"status": HandoffStatusEnum.ESCALATED.value},
+                reason=reason,
+            )
+
+        return event
+
+    def check_and_escalate_overdue(self) -> List[EscalationEvent]:
+        """
+        Background job: Check for overdue items in ACCEPTED handoffs.
+        Escalate any handoff with items past their due date.
+        
+        Returns: List of escalation events created
+        """
+        
+        active_handoffs = self.handoff_repo.find_active_handoffs()
+        overdue_items = self.item_repo.find_overdue()
+        
+        escalated_events = []
+        escalated_handoff_ids = set()
+
+        for item in overdue_items:
+            handoff = next(
+                (h for h in active_handoffs if h.id == item.handoff_id),
+                None
+            )
+            
+            if not handoff:
+                continue
+            
+            # Avoid escalating same handoff multiple times in one job run
+            if handoff.id in escalated_handoff_ids:
+                continue
+
+            event = self.escalate_handoff(
+                handoff_id=handoff.id,
+                triggered_by="AUTO",
+                reason=f"Item '{item.title}' overdue since {item.due_date}",
+                user_id=None,  # System action
+                action_taken="Auto-escalated by background job",
+            )
+            
+            escalated_events.append(event)
+            escalated_handoff_ids.add(handoff.id)
+
+        return escalated_events
+
+    def get_escalation_history(self, handoff_id: str) -> List[EscalationEvent]:
+        """Get all escalation events for a handoff."""
+        
+        handoff = self.handoff_repo.get(handoff_id)
+        if not handoff:
+            raise ResourceNotFound("Handoff", handoff_id)
+        
+        return self.escalation_repo.find_by_handoff(handoff_id)
+
+    def get_recent_escalations(self, limit: int = 50) -> List[EscalationEvent]:
+        """Get recent escalation events."""
+        return self.escalation_repo.find_recent(limit)
+
+    def resolve_escalation(
+        self,
+        handoff_id: str,
+        user_id: str,
+        action_taken: str,
+    ) -> Handoff:
+        """
+        Resolve escalation by transitioning back to PENDING_REVIEW.
+        
+        This allows the handoff to be reviewed again and potentially accepted
+        after the escalating issue has been addressed.
+        """
+        
+        handoff = self.handoff_repo.get(handoff_id)
+        if not handoff:
+            raise ResourceNotFound("Handoff", handoff_id)
+        
+        if handoff.status != HandoffStatusEnum.ESCALATED:
+            raise ValueError(f"Handoff must be ESCALATED, currently {handoff.status.value}")
+
+        old_status = handoff.status.value
+        handoff.status = HandoffStatusEnum.PENDING_REVIEW
+        handoff.updated_at = datetime.utcnow()
+        handoff = self.handoff_repo.create(handoff)
+
+        self.audit_service.log_action(
+            user_id=user_id,
+            entity_type="HANDOFF",
+            entity_id=handoff_id,
+            action="UPDATE",
+            old_values={"status": old_status},
+            new_values={"status": HandoffStatusEnum.PENDING_REVIEW.value},
+            reason=f"Escalation resolved. Action: {action_taken}",
+        )
+
+        return handoff
